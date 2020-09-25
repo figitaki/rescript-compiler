@@ -12419,6 +12419,7 @@ end = struct
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. *)
 
+[@@@warning "+9"]
 
 type t =
   { 
@@ -12426,16 +12427,46 @@ type t =
     st_mtimes : float array;
     source_directory :  string ;    
   }
+(* float_of_string_opt *)
+external hexstring_of_float : float -> int -> char -> string
+  = "caml_hexstring_of_float"
 
+let hex_of_float f = hexstring_of_float f (-1) '-'
 
-let magic_number = Bs_version.version
+(* This should not lose any preicision *)
+(* let id (f : float) = 
+    float_of_string (hex_of_float f) = f
+ *)
+
+let encode ( {source_directory ; st_mtimes; dir_or_files} : t ) 
+    (buf: Ext_buffer.t)= 
+  Ext_buffer.add_string_char buf Bs_version.version '\n';  
+  Ext_buffer.add_string_char buf source_directory '\n';
+  let dir_or_files_len = Array.length dir_or_files in 
+  (if dir_or_files_len <> 0 then begin 
+    Ext_buffer.add_string buf dir_or_files.(0);
+    for i = 1 to dir_or_files_len - 1 do 
+      Ext_buffer.add_char_string buf '\t' dir_or_files.(i) 
+    done  
+  end);
+  Ext_buffer.add_char buf '\n';
+  let st_mtimes_len = Array.length st_mtimes in 
+  (if st_mtimes_len <> 0 then begin 
+    Ext_buffer.add_string buf (hex_of_float st_mtimes.(0));
+    for i = 1 to st_mtimes_len - 1 do 
+      Ext_buffer.add_char_string buf '\t' (hex_of_float st_mtimes.(i))  
+    done     
+  end);
+  Ext_buffer.add_char buf '\n'
+  
 
 (* TODO: for such small data structure, maybe text format is better *)
 
 let write (fname : string)  (x : t) =
+  let buf = Ext_buffer.create 1_000 in   
+  encode x buf;  
   let oc = open_out_bin fname in
-  output_string oc magic_number ;
-  output_value oc x ;
+  Ext_buffer.output_buffer oc buf ;
   close_out oc
 
 
@@ -12472,17 +12503,23 @@ let rec check_aux cwd (xs : string array) (ys: float array) i finish =
       check_aux cwd xs ys (i + 1 ) finish
     else Other current_file
 
+    
 
-let read (fname : string) (cont : t -> check_result) =
-  match open_in_bin fname with   (* Windows binary mode*)
-  | ic ->
-    let buffer = really_input_string ic (String.length magic_number) in
-    if (buffer <> magic_number) then Bsb_bsc_version_mismatch
-    else
-      let res : t = input_value ic  in
-      close_in ic ;
-      cont res
-  | exception _ -> Bsb_file_not_exist
+
+let read ic  =
+  let source_directory = input_line ic in 
+  let dir_or_files = input_line ic in 
+  let dir_or_files = 
+    Array.of_list 
+      (Ext_string.split dir_or_files '\t') in 
+  let st_mtimes_line = 
+    input_line ic in 
+  let st_mtimes = 
+    Ext_array.of_list_map 
+      (Ext_string.split st_mtimes_line '\t')   
+      (fun x -> float_of_string x) in 
+  close_in ic ;
+  {dir_or_files; st_mtimes; source_directory}
 
 let record ~per_proj_dir ~file  (file_or_dirs : string list) : unit =
   let dir_or_files = Array.of_list file_or_dirs in 
@@ -12492,8 +12529,9 @@ let record ~per_proj_dir ~file  (file_or_dirs : string list) : unit =
            (Unix.stat (Filename.concat per_proj_dir  x )).st_mtime
          )
   in 
-  write (file ^ "_js" )
-    { st_mtimes ;
+  write file
+    { 
+      st_mtimes ;
       dir_or_files;
       source_directory = per_proj_dir ;
     }
@@ -12505,21 +12543,28 @@ let record ~per_proj_dir ~file  (file_or_dirs : string list) : unit =
     bit in case we found a different version of compiler
 *)
 let check ~(per_proj_dir:string) ~forced ~file : check_result =
-  read ( file ^ "_js" )  (fun  {
-      dir_or_files ; source_directory; st_mtimes
-    } ->
-      if per_proj_dir <> source_directory then Bsb_source_directory_changed else
-      if forced then Bsb_forced (* No need walk through *)
-      else
-        try
-          check_aux per_proj_dir dir_or_files st_mtimes  0 (Array.length dir_or_files)
-        with e ->
-          begin
-            Bsb_log.info
-              "@{<info>Stat miss %s@}@."
-              (Printexc.to_string e);
-            Bsb_file_not_exist        
-          end)
+  match  open_in_bin file with   (* Windows binary mode*)    
+  | exception _ -> Bsb_file_not_exist
+  | ic ->
+    if input_line ic <> Bs_version.version then Bsb_bsc_version_mismatch
+    else 
+      match read ic with 
+      | exception _ -> Bsb_file_not_exist (* corrupted file *)
+      | {
+        dir_or_files ; source_directory; st_mtimes
+      } ->
+        if per_proj_dir <> source_directory then Bsb_source_directory_changed else
+        if forced then Bsb_forced (* No need walk through *)
+        else
+          try
+            check_aux per_proj_dir dir_or_files st_mtimes  0 (Array.length dir_or_files)
+          with e ->
+            begin
+              Bsb_log.info
+                "@{<info>Stat miss %s@}@."
+                (Printexc.to_string e);
+              Bsb_file_not_exist        
+            end
 
 
 end
